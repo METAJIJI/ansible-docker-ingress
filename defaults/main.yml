@@ -1,0 +1,27 @@
+---
+
+_py_ver: "{{ {2: '', 3: '3'}[ansible_python.version.major] }}"
+
+docker_ingress_packages:
+  - python3  # For venv
+  - "{{ 'python%s-setuptools' | format(_py_ver) }}"
+
+docker_ingress_dir: /opt/docker-ingress
+docker_ingress_pip_venv_command: /usr/bin/python3 -m venv
+docker_ingress_venv_dir: "{{ docker_ingress_dir }}/venv"
+docker_ingress_venv_packages:
+  - docker
+  - docker-compose
+  - passlib
+
+docker_ingress_htpasswd: []
+#   - path: domain.tld
+#     name: admin
+#     password: t0ps3cr3t
+
+docker_ingress_env_files: []
+# docker_ingress_env_files:
+#   - path: .env
+#     mode: 0644
+#     data:
+#       KEY: VALUE

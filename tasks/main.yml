@@ -1,0 +1,80 @@
+---
+
+- name: Install packages
+  yum:
+    name: "{{ docker_ingress_packages }}"
+  tags:
+    - install
+
+- name: Install virtualenv packages
+  pip:
+    virtualenv: "{{ docker_ingress_venv_dir }}"
+    name: "{{ docker_ingress_venv_packages }}"
+    virtualenv_command: "{{ docker_ingress_pip_venv_command }}"
+  tags:
+    - install
+    - pip
+
+- name: Create docker-ingress directories if it does not exist
+  file:
+    path: "{{ docker_ingress_dir }}/{{ item.path }}"
+    state: directory
+    mode: "0755"
+  loop: "{{
+        lookup('filetree', '%s/files/docker-ingress' | format(role_path))
+            | selectattr('state', 'equalto', 'directory') | list
+    }}"
+  tags:
+    - docker-compose
+
+- name: Copy docker-ingress files
+  copy:
+    src: "docker-ingress/{{ item.path }}"
+    dest: "{{ docker_ingress_dir }}/{{ item.path }}"
+    mode: "0644"
+  loop: "{{
+        lookup('filetree', '%s/files/docker-ingress' | format(role_path))
+            | selectattr('state', 'equalto', 'file') | list
+    }}"
+  tags:
+    - docker-compose
+
+- name: Create htpasswd files
+  htpasswd:
+    path: "{{ docker_ingress_dir }}/volumes/nginx/htpasswd/{{ item.path }}"
+    name: "{{ item.name }}"
+    password: "{{ item.password }}"
+  loop: "{{ docker_ingress_htpasswd }}"
+  vars:
+    ansible_python_interpreter: "{{ docker_ingress_venv_dir }}/bin/python"
+  tags:
+    - docker-compose
+    - htpasswd
+
+- name: Render .env files
+  copy:
+    dest: "{{ docker_ingress_dir }}/{{ item.path }}"
+    content: "{% for k in item.data.keys() | sort %}{{ k }}={{ item.data[k] }}\n{% endfor %}"
+    mode: "{{ item.mode | default('0644') }}"
+  register: _changed_tasks_env
+  loop: "{{ docker_ingress_env_files }}"
+  tags:
+    - docker-compose
+    - dot-env
+
+- name: Deploy docker-compose.yml
+  docker_compose:
+    state: present
+    files:
+      - docker-compose.yml
+    project_src: "{{ docker_ingress_dir }}"
+    recreate: "{{ (True in _tasks_status) | ternary('always', 'smart') }}"
+  vars:
+    _tasks_status: "{{
+        vars | select('match', '^_changed_tasks_')
+            | map('extract', vars)
+            | map(attribute='changed') | list
+    }}"
+    ansible_python_interpreter: "{{ docker_ingress_venv_dir }}/bin/python"
+  tags:
+    - docker-compose
