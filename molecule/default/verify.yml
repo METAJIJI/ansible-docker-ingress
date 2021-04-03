@@ -1,0 +1,11 @@
+---
+
+- name: Verify
+  hosts: all
+  tasks:
+    - name: Verify docker ingress is alive
+      uri:
+        url: "http://{{ ansible_default_ipv4.address }}:80"
+        method: GET
+        status_code: 503
+        use_proxy: false

@@ -1,7 +1,10 @@
 {{ $CurrentContainer := where $ "ID" .Docker.CurrentContainerID | first }}
 
 {{ define "upstream" }}
-	{{ if .Address }}
+	{{ if .ExternalHost }}
+		{{ $external_port := or (.Container.Env.VIRTUAL_PORT) "80" }}
+		server {{ .ExternalHost }}:{{ $external_port }};
+	{{ else if .Address }}
 		{{/* If we got the containers from swarm and this container's port is published to host, use host IP:PORT */}}
 		{{ if and .Container.Node.ID .Address.HostPort }}
 			# {{ .Container.Node.Name }}/{{ .Container.Name }}
@@ -28,16 +31,19 @@ location {{ .Path }} {
 		include uwsgi_params;
 		uwsgi_pass {{ trim .Proto }}://{{ trim .Upstream }};
 	{{ else if eq .Proto "fastcgi" }}
-		root   {{ trim .Vhostroot }};
+		root {{ trim .Vhostroot }};
 		include fastcgi.conf;
+		fastcgi_hide_header X-Powered-By;
+		fastcgi_param PHP_ADMIN_VALUE 'expose_php=off';
+		fastcgi_param X-Time '$request_time';
 		fastcgi_pass {{ trim .Upstream }};
 	{{ else }}
 		proxy_pass {{ trim .Proto }}://{{ trim .Upstream }}{{ .ProxyPassPath }};
 	{{ end }}
 
 	{{ if (exists (printf "/etc/nginx/htpasswd%s%s" .Path .Host)) }}
-		auth_basic	"Restricted {{ .Host }}";
-		auth_basic_user_file	{{ (printf "/etc/nginx/htpasswd%s%s" .Path .Host) }};
+		auth_basic Restricted {{ .Host }}";
+		auth_basic_user_file {{ (printf "/etc/nginx/htpasswd%s%s" .Path .Host) }};
 	{{ end }}
 
 	{{ if (exists (printf "/etc/nginx/vhost.d/%s_location" .Host)) }}
@@ -52,27 +58,32 @@ location {{ .Path }} {
 	{{ $networks := .Networks }}
 	upstream {{ .Upstream }} {
 		{{ range $container := .Containers }}
-			{{ $addrLen := len $container.Addresses }}
-			{{ range $knownNetwork := $networks }}
-				{{ range $containerNetwork := $container.Networks }}
-					{{ if (and (ne $containerNetwork.Name "ingress") (or (eq $knownNetwork.Name $containerNetwork.Name) (eq $knownNetwork.Name "host"))) }}
-						## Can be connected with "{{ $containerNetwork.Name }}" network
-						{{/* If only 1 port exposed, use that */}}
-						{{ if eq $addrLen 1 }}
-							{{ $address := index $container.Addresses 0 }}
-							{{ template "upstream" (dict "Container" $container "Address" $address "Network" $containerNetwork) }}
-						{{/* If more than one port exposed, use the one matching VIRTUAL_PORT env var, falling back to standard web port 80 */}}
+			{{ if $container.Env.VIRTUAL_PROXY_PASS_EXTERNAL_HOST }}
+				{{ $external_host := $container.Env.VIRTUAL_PROXY_PASS_EXTERNAL_HOST }}
+				{{ template "upstream" (dict "Container" $container "ExternalHost" $external_host) }}
+			{{ else }}
+				{{ $addrLen := len $container.Addresses }}
+				{{ range $knownNetwork := $networks }}
+					{{ range $containerNetwork := $container.Networks }}
+						{{ if (and (ne $containerNetwork.Name "ingress") (or (eq $knownNetwork.Name $containerNetwork.Name) (eq $knownNetwork.Name "host"))) }}
+							## Can be connected with "{{ $containerNetwork.Name }}" network
+							{{/* If only 1 port exposed, use that */}}
+							{{ if eq $addrLen 1 }}
+								{{ $address := index $container.Addresses 0 }}
+								{{ template "upstream" (dict "Container" $container "Address" $address "Network" $containerNetwork) }}
+							{{/* If more than one port exposed, use the one matching VIRTUAL_PORT env var, falling back to standard web port 80 */}}
+							{{ else }}
+								{{ $port := coalesce $container.Env.VIRTUAL_PORT "80" }}
+								{{ $address := where $container.Addresses "Port" $port | first }}
+								{{ template "upstream" (dict "Container" $container "Address" $address "Network" $containerNetwork) }}
+							{{ end }}
 						{{ else }}
-							{{ $port := coalesce $container.Env.VIRTUAL_PORT "80" }}
-							{{ $address := where $container.Addresses "Port" $port | first }}
-							{{ template "upstream" (dict "Container" $container "Address" $address "Network" $containerNetwork) }}
+							# Cannot connect to network of this container
+							server 127.0.0.1 down;
 						{{ end }}
-					{{ else }}
-						# Cannot connect to network of this container
-						server 127.0.0.1 down;
 					{{ end }}
 				{{ end }}
-			{{ end }}
+			{{ end }}{{/* VIRTUAL_PROXY_PASS_EXTERNAL_HOST */}}
 		{{ end }}
 	}
 {{ end }}
@@ -180,7 +191,6 @@ server {
 {{ end }}
 
 {{ range $host, $containers := groupByMulti $ "Env.VIRTUAL_HOST" "," }}
-
 {{ $host := trim $host }}
 {{ $is_regexp := hasPrefix "~" $host }}
 {{ $upstream_name := when $is_regexp (sha1 $host) $host }}
@@ -192,9 +202,14 @@ server {
 	# {{ $host }}
 	{{ template "upstream-definition" (dict "Upstream" $upstream_name "Containers" $containers "Networks" $CurrentContainer.Networks) }}
 {{ else }}
+
+{{/* TODO {{ range $path, $path_containers := groupByMulti $containers "Env.VIRTUAL_PATH" "," }}
+#PATH: {{ json $path }}
+#PATH_CONTAINERS" {{ json $path_containers }}
+{{ end }} */}}
+
 	{{ range $path, $containers := $paths }}
-		{{ $sum := sha1 $path }}
-		{{ $upstream := printf "%s-%s" $upstream_name $sum }}
+		{{ $upstream := printf "%s-%s" $upstream_name (sha1 $path) }}
 		# {{ $host }}{{ $path }}
 		{{ template "upstream-definition" (dict "Upstream" $upstream "Containers" $containers "Networks" $CurrentContainer.Networks) }}
 	{{ end }}
@@ -202,9 +217,6 @@ server {
 
 {{ $default_host := or ($.Env.DEFAULT_HOST) "" }}
 {{ $default_server := index (dict $host "" $default_host "default_server") $host }}
-
-{{/* Get the VIRTUAL_PROTO defined by containers w/ the same vhost, falling back to "http" */}}
-{{ $proto := trim (or (first (groupByKeys $containers "Env.VIRTUAL_PROTO")) "http") }}
 
 {{/* Get the NETWORK_ACCESS defined by containers w/ the same vhost, falling back to "external" */}}
 {{ $network_tag := or (first (groupByKeys $containers "Env.NETWORK_ACCESS")) "external" }}
@@ -218,15 +230,11 @@ server {
 {{/* Get the HSTS defined by containers w/ the same vhost, falling back to "max-age=31536000" */}}
 {{ $hsts := or (first (groupByKeys $containers "Env.HSTS")) "max-age=31536000" }}
 
-{{/* Get the VIRTUAL_ROOT By containers w/ use fastcgi root */}}
-{{ $vhost_root := or (first (groupByKeys $containers "Env.VIRTUAL_ROOT")) "/var/www/public" }}
-
 {{/* Get the VIRTUAL_LISTEN_HTTP_PORT By containers */}}
 {{ $listen_http_port := or (first (groupByKeys $containers "Env.VIRTUAL_LISTEN_HTTP_PORT")) "80" }}
 
 {{/* Get the VIRTUAL_LISTEN_HTTPS_PORT By containers */}}
 {{ $listen_https_port := or (first (groupByKeys $containers "Env.VIRTUAL_LISTEN_HTTPS_PORT")) "443" }}
-
 
 {{/* Get the first cert name defined by containers w/ the same vhost */}}
 {{ $certName := (first (groupByKeys $containers "Env.CERT_NAME")) }}
@@ -336,12 +344,26 @@ server {
 
 	{{ if eq $nPaths 0 }}
 		{{ $proxy_pass_path := trim (or (first (groupByKeys $containers "Env.VIRTUAL_PROXY_PASS_PATH")) "") }}
+
+		{{/* Get the VIRTUAL_PROTO defined by containers w/ the same vhost, falling back to "http" */}}
+		{{ $proto := trim (or (first (groupByKeys $containers "Env.VIRTUAL_PROTO")) "http") }}
+
+		{{/* Get the VIRTUAL_ROOT By containers w/ use fastcgi root */}}
+		{{ $vhost_root := or (first (groupByKeys $containers "Env.VIRTUAL_ROOT")) "/var/www/public" }}
+
 		{{ template "location" (dict "Path" "/" "ProxyPassPath" $proxy_pass_path "Proto" $proto "Upstream" $upstream_name "Host" $host "Vhostroot" $vhost_root) }}
 	{{ else }}
 		{{ range $path, $containers := $paths }}
+			{{ $upstream := printf "%s-%s" $host (sha1 $path) }}
+
 			{{ $proxy_pass_path := trim (or (first (groupByKeys $containers "Env.VIRTUAL_PROXY_PASS_PATH")) "") }}
-			{{ $sum := sha1 $path }}
-			{{ $upstream := printf "%s-%s" $host $sum }}
+
+			{{/* Get the VIRTUAL_PROTO defined by containers w/ the same vhost, falling back to "http" */}}
+			{{ $proto := trim (or (first (groupByKeys $containers "Env.VIRTUAL_PROTO")) "http") }}
+
+			{{/* Get the VIRTUAL_ROOT By containers w/ use fastcgi root */}}
+			{{ $vhost_root := or (first (groupByKeys $containers "Env.VIRTUAL_ROOT")) "/var/www/public" }}
+
 			{{ template "location" (dict "Path" $path "ProxyPassPath" $proxy_pass_path "Proto" $proto "Upstream" $upstream "Host" $host "Vhostroot" $vhost_root) }}
 		{{ end }}
 	{{ end }}
@@ -373,12 +395,26 @@ server {
 
 	{{ if eq $nPaths 0 }}
 		{{ $proxy_pass_path := trim (or (first (groupByKeys $containers "Env.VIRTUAL_PROXY_PASS_PATH")) "") }}
+
+		{{/* Get the VIRTUAL_PROTO defined by containers w/ the same vhost, falling back to "http" */}}
+		{{ $proto := trim (or (first (groupByKeys $containers "Env.VIRTUAL_PROTO")) "http") }}
+
+		{{/* Get the VIRTUAL_ROOT By containers w/ use fastcgi root */}}
+		{{ $vhost_root := or (first (groupByKeys $containers "Env.VIRTUAL_ROOT")) "/var/www/public" }}
+
 		{{ template "location" (dict "Path" "/" "ProxyPassPath" $proxy_pass_path "Proto" $proto "Upstream" $upstream_name "Host" $host "Vhostroot" $vhost_root) }}
 	{{ else }}
 		{{ range $path, $containers := $paths }}
+			{{ $upstream := printf "%s-%s" $host (sha1 $path) }}
+
 			{{ $proxy_pass_path := trim (or (first (groupByKeys $containers "Env.VIRTUAL_PROXY_PASS_PATH")) "") }}
-			{{ $sum := sha1 $path }}
-			{{ $upstream := printf "%s-%s" $upstream_name $sum }}
+
+			{{/* Get the VIRTUAL_PROTO defined by containers w/ the same vhost, falling back to "http" */}}
+			{{ $proto := trim (or (first (groupByKeys $containers "Env.VIRTUAL_PROTO")) "http") }}
+
+			{{/* Get the VIRTUAL_ROOT By containers w/ use fastcgi root */}}
+			{{ $vhost_root := or (first (groupByKeys $containers "Env.VIRTUAL_ROOT")) "/var/www/public" }}
+
 			{{ template "location" (dict "Path" $path "ProxyPassPath" $proxy_pass_path "Proto" $proto "Upstream" $upstream "Host" $host "Vhostroot" $vhost_root) }}
 		{{ end }}
 	{{ end }}
